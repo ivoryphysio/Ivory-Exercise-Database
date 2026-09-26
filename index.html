@@ -436,19 +436,9 @@ import {
 import {
   getFirestore, collection, doc, getDoc, setDoc, updateDoc, deleteDoc, addDoc, onSnapshot, serverTimestamp
 } from "https://www.gstatic.com/firebasejs/10.13.2/firebase-firestore.js";
-import {
-  getStorage, ref, uploadString, getDownloadURL, deleteObject
-} from "https://www.gstatic.com/firebasejs/10.13.2/firebase-storage.js";
 
 /* =====================================================================
-   {
-  apiKey: "AIzaSyDtwZ7zlsTtEt6sUHSgc2f0rCFBY1ZB2_c",
-  authDomain: "ivory-exercise-database.firebaseapp.com",
-  projectId: "ivory-exercise-database",
-  storageBucket: "ivory-exercise-database.firebasestorage.app",
-  messagingSenderId: "319675059578",
-  appId: "1:319675059578:web:a7dfc509ff8bf3dd381ac3"
-};
+   PASTE YOUR FIREBASE CONFIG HERE — from Project settings → Your apps
    ===================================================================== */
 const firebaseConfig = {
   apiKey: "AIzaSyDtwZ7zlsTtEt6sUHSgc2f0rCFBY1ZB2_c",
@@ -458,12 +448,12 @@ const firebaseConfig = {
   messagingSenderId: "319675059578",
   appId: "1:319675059578:web:a7dfc509ff8bf3dd381ac3"
 };
+
 /* ===================================================================== */
 
 const fbApp = initializeApp(firebaseConfig);
 const auth = getAuth(fbApp);
 const db = getFirestore(fbApp);
-const storage = getStorage(fbApp);
 
 /* ================= constants ================= */
 var REGION_ORDER=["Neck","Scapular","Thoracic","Core / Low back","Glutes & adductors","Shoulder","Hip","Knee","Ankle & foot","General","Core","Back extensor","Glutes"];
@@ -657,36 +647,24 @@ function resizeImage(file,maxW,cb){
 function renderAll(){renderPicker();renderHandout();renderBank();}
 
 /* =====================================================================
-   FIRESTORE + STORAGE DATA LAYER
+   FIRESTORE-ONLY DATA LAYER (no Firebase Storage — avoids needing a
+   billing account; photos are just embedded as base64 text)
    Collections:
      settings/clinic        -> { name }
-     exercises/{autoId}     -> { name, region, sets, reps, hold, photoURL }
-   Storage:
-     exercise-photos/{exerciseId}.jpg
+     exercises/{autoId}     -> { name, region, sets, reps, hold, photo }
    ===================================================================== */
-async function uploadPhoto(exerciseId, dataUrl){
-  var photoRef = ref(storage, "exercise-photos/"+exerciseId+".jpg");
-  await uploadString(photoRef, dataUrl, "data_url");
-  return await getDownloadURL(photoRef);
-}
-async function deletePhoto(exerciseId){
-  try{ await deleteObject(ref(storage, "exercise-photos/"+exerciseId+".jpg")); }catch(e){ /* may not exist */ }
-}
 async function addExerciseDoc(data, photoDataUrl){
   var newRef = doc(collection(db,"exercises"));
-  var photoURL = "";
-  if(photoDataUrl) photoURL = await uploadPhoto(newRef.id, photoDataUrl);
-  await setDoc(newRef, Object.assign({}, data, {photoURL:photoURL, updatedAt:serverTimestamp()}));
+  await setDoc(newRef, Object.assign({}, data, {photo:photoDataUrl||"", updatedAt:serverTimestamp()}));
 }
 async function updateExerciseDoc(id, data, photoDataUrl){
   var patch = Object.assign({}, data, {updatedAt:serverTimestamp()});
-  if(photoDataUrl) patch.photoURL = await uploadPhoto(id, photoDataUrl);
+  if(photoDataUrl) patch.photo = photoDataUrl;
   await updateDoc(doc(db,"exercises",id), patch);
 }
 async function deleteExercise(id){
   try{
     await deleteDoc(doc(db,"exercises",id));
-    deletePhoto(id);
     handout=handout.filter(function(h){return h.id!==id;});
     toast("Exercise deleted");
   }catch(e){ toast("Couldn't delete \u2014 check your connection", true); }
@@ -712,7 +690,7 @@ function startListeners(){
 
   unsubExercises = onSnapshot(collection(db,"exercises"), function(snap){
     exercises = snap.docs.map(function(d){
-      var x=d.data(); x.id=d.id; x.photo = x.photoURL || PLACEHOLDER; return x;
+      var x=d.data(); x.id=d.id; x.photo = x.photo || PLACEHOLDER; return x;
     });
     document.getElementById("loadingScreen").style.display="none";
     document.getElementById("view-build").style.display="";
@@ -743,7 +721,7 @@ document.getElementById("addExBtn").onclick=function(){openModal(null);};
 document.getElementById("backupBtn").onclick=function(){
   if(!exercises.length){toast("Nothing to back up yet");return;}
   var payload={app:"ivory-physio",version:2,savedAt:new Date().toISOString(),clinic:clinicName,
-    exercises:exercises.map(function(e){return {name:e.name,region:e.region,sets:e.sets,reps:e.reps,hold:e.hold,photoURL:e.photoURL||""};})};
+    exercises:exercises.map(function(e){return {name:e.name,region:e.region,sets:e.sets,reps:e.reps,hold:e.hold,photo:e.photo||""};})};
   var blob=new Blob([JSON.stringify(payload)],{type:"application/json"});
   var url=URL.createObjectURL(blob);
   var a=document.createElement("a");
@@ -754,9 +732,9 @@ document.getElementById("backupBtn").onclick=function(){
   toast("Backed up \u2014 "+exercises.length+" exercises");
 };
 
-/* Restore = full replace. Import = merge, skipping duplicates. Both accept
-   either legacy base64 "photo" fields (uploaded fresh to Storage) or
-   "photoURL" links (used as-is). */
+/* Restore = full replace. Import = merge, skipping duplicates. Accepts
+   either a base64 "photo" field or a "photoURL" link (used as-is either way —
+   both just get saved straight into the Firestore document). */
 async function bulkLoad(items, mode){
   var have={};
   if(mode==="merge") exercises.forEach(function(e){have[normKey(e.name,e.region)]=true;});
@@ -774,20 +752,16 @@ async function bulkLoad(items, mode){
     var oldIds = exercises.map(function(e){return e.id;});
     for(var i=0;i<oldIds.length;i++){
       await deleteDoc(doc(db,"exercises",oldIds[i])).catch(function(){});
-      deletePhoto(oldIds[i]);
     }
   }
   for(var j=0;j<toAdd.length;j++){
     var x=toAdd[j];
     setSync("busy","Adding "+(j+1)+" of "+toAdd.length+"\u2026");
     var newRef = doc(collection(db,"exercises"));
-    var photoURL = x.photoURL || "";
-    if(!photoURL && x.photo && String(x.photo).indexOf("data:")===0){
-      try{ photoURL = await uploadPhoto(newRef.id, x.photo); }catch(e){ /* keep going without photo */ }
-    }
+    var photo = x.photo || x.photoURL || "";
     await setDoc(newRef, {
       name:x.name, region:x.region||"General", sets:x.sets||"", reps:x.reps||"", hold:x.hold||"",
-      photoURL:photoURL, updatedAt:serverTimestamp()
+      photo:photo, updatedAt:serverTimestamp()
     }).catch(function(){});
   }
   return toAdd.length;
